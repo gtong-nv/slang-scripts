@@ -5,6 +5,17 @@ import os
 import logging
 from datetime import datetime
 from pathlib import Path
+from colorama import init, Fore, Style
+
+# Initialize colorama for Windows support
+init()
+
+# Path configurations
+SLANG_REPO_PATH = r"C:\nv\slang"
+SGL_REPO_PATH   = r"C:\nv\sgl"
+PERF_TEST_PATH  = r"C:\nv\slangpy\examples\simplified-splatting"
+BUILD_CMD       = "cmake --build build --config Release -j12"
+GIT_SUBMODULE_UPDATE_CMD = "git submodule update --init --recursive"
 
 # Create logs directory if it doesn't exist
 log_dir = Path("bisect_logs")
@@ -21,55 +32,69 @@ logging.basicConfig(
     ]
 )
 
-def save_output_log(phase, commit_hash, output, error=None):
-    """Save command output to a log file"""
-    log_file = log_dir / f'{commit_hash}_{phase}_{timestamp}.log'
-    with open(log_file, 'w', encoding='utf-8') as f:
-        f.write(f"Phase: {phase}\n")
-        f.write(f"Commit: {commit_hash}\n")
-        f.write(f"Timestamp: {datetime.now()}\n")
-        f.write("-" * 80 + "\n")
-        f.write("OUTPUT:\n")
-        f.write(str(output))
-        if error:
-            f.write("\nERROR:\n")
-            f.write(str(error))
-    return log_file
 
 def run_command(cmd, cwd=None, shell=True, phase=None, commit=None):
     """Run a command and return its output, saving logs regardless of success/failure"""
+    print(f"Running command: {cmd}")
     try:
-        # Run process and capture output
-        process = subprocess.run(
-            cmd,
-            cwd=cwd,
-            shell=shell,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False  # Don't raise exception immediately on non-zero return
-        )
+        # Create log file path
+        log_file = log_dir / f'{commit}_{phase}_{timestamp}.log' if phase and commit else log_dir / f'command_{timestamp}.log'
         
-        # Print output
-        if process.stdout:
-            print(process.stdout)
-        if process.stderr:
-            print(process.stderr)
+        # Store complete output for return value
+        complete_output = []
+        
+        with open(log_file, 'w', encoding='utf-8') as f:
+            # Write header information to log file
+            if phase and commit:
+                f.write(f"Phase: {phase}\n")
+                f.write(f"Commit: {commit}\n")
+                f.write(f"Timestamp: {datetime.now()}\n")
+                f.write("-" * 80 + "\n")
+                f.write("OUTPUT:\n")
+                f.flush()
             
-        # Save logs if requested
-        if phase and commit:
-            log_file = save_output_log(phase, commit, process.stdout, process.stderr)
-        
-        # Check return code and raise exception if non-zero
-        if process.returncode != 0:
-            logging.warning(f"Command returned non-zero exit code: {process.returncode}")
-            raise subprocess.CalledProcessError(process.returncode, cmd, process.stdout, process.stderr)
-        
-        return process.stdout
+            # Run process with pipe for output
+            process = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                shell=shell,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            # Read and handle output in real-time
+            for line in process.stdout:
+                # Store for return value
+                complete_output.append(line)
+                
+                # Write to terminal
+                sys.stdout.write(line)
+                
+                # Write to log file
+                f.write(line)
+                f.flush()
+            
+            # Wait for process to complete
+            process.wait()
+            
+            # Check return code
+            if process.returncode != 0:
+                error_msg = f"Command returned non-zero exit code: {process.returncode}"
+                logging.warning(error_msg)
+                f.write(f"\nERROR: {error_msg}\n")
+                raise subprocess.CalledProcessError(process.returncode, cmd, ''.join(complete_output))
+            
+            # Print completion message
+            completion_msg = f"Command completed successfully with return code: {process.returncode}"
+            print(f"{Fore.GREEN}{completion_msg}{Style.RESET_ALL}")
+            f.write(f"\n{completion_msg}\n")
+            
+        return ''.join(complete_output)
         
     except subprocess.CalledProcessError as e:
         if phase and commit:
-            log_file = save_output_log(phase, commit, e.stdout, e.stderr)
             logging.error(f"Command failed: {cmd}. Logs saved to {log_file}")
         raise
 
@@ -77,8 +102,10 @@ def checkout_commit(commit_hash, repo_path):
     """Checkout a specific commit"""
     logging.info(f"Checking out commit: {commit_hash}")
     try:
-        run_command(f"git checkout {commit_hash}", cwd=repo_path, 
+        run_command(f"git checkout {commit_hash}", cwd=repo_path, shell=True,
                    phase="checkout", commit=commit_hash)
+        run_command(GIT_SUBMODULE_UPDATE_CMD, cwd=repo_path, shell=True,
+                   phase="git_submodule_update", commit=commit_hash)
         return True
     except subprocess.CalledProcessError:
         logging.error(f"Failed to checkout commit {commit_hash}")
@@ -90,14 +117,9 @@ def build_slang(commit_hash):
     try:
         # Create a timestamped log file name for this build
         build_log_file = log_dir / f'slang_build_{commit_hash}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-        
-        # Build command with verbose logging - using PowerShell redirection
-        build_cmd = (
-            f"cmake --build build --config Release -j10 --clean-first"
-        )
-        
-        run_command(build_cmd, 
-                   cwd=r"C:\Users\tongg\nv\slang",
+
+        run_command(BUILD_CMD, 
+                   cwd=SLANG_REPO_PATH,
                    phase="build_slang", 
                    commit=commit_hash)
         return True
@@ -118,7 +140,7 @@ def build_sgl(commit_hash):
         )
         
         run_command(build_cmd, 
-                   cwd=r"C:\Users\tongg\nv\sgl",
+                   cwd=SGL_REPO_PATH,
                    phase="build_sgl", 
                    commit=commit_hash)
         return True
@@ -132,7 +154,7 @@ def run_perf_test(commit_hash):
     try:
         output = run_command(
             "python3 .\\main.py",
-            cwd=r"C:\Users\tongg\nv\slangpy\examples\simplified-splatting",
+            cwd=PERF_TEST_PATH,
             phase="perf_test", commit=commit_hash
         )
         
@@ -162,7 +184,7 @@ def evaluate_commit(commit_hash):
     
     try:
         # Checkout
-        results['checkout_success'] = checkout_commit(commit_hash, r"C:\Users\tongg\nv\slang")
+        results['checkout_success'] = checkout_commit(commit_hash, SLANG_REPO_PATH)
         if not results['checkout_success']:
             logging.warning(f"Skipping commit {commit_hash} due to checkout failure")
             return None, results
@@ -206,24 +228,23 @@ def main():
     logging.info(f"Starting bisect between good commit {good_commit} and bad commit {bad_commit}")
 
     # Verify the commits exist and get their full hashes
-    slang_repo = r"C:\Users\tongg\nv\slang"
     try:
-        good_hash = run_command(f"git rev-parse {good_commit}", cwd=slang_repo).strip()
-        bad_hash = run_command(f"git rev-parse {bad_commit}", cwd=slang_repo).strip()
+        good_hash = run_command(f"git rev-parse {good_commit}", cwd=SLANG_REPO_PATH).strip()
+        bad_hash = run_command(f"git rev-parse {bad_commit}", cwd=SLANG_REPO_PATH).strip()
     except subprocess.CalledProcessError:
         logging.error("Invalid commit hashes provided")
         sys.exit(1)
 
     # Start bisect
-    run_command("git bisect start", cwd=slang_repo)
-    run_command(f"git bisect good {good_hash}", cwd=slang_repo)
-    run_command(f"git bisect bad {bad_hash}", cwd=slang_repo)
+    run_command("git bisect start", cwd=SLANG_REPO_PATH)
+    run_command(f"git bisect good {good_hash}", cwd=SLANG_REPO_PATH)
+    run_command(f"git bisect bad {bad_hash}", cwd=SLANG_REPO_PATH)
 
     results = []
     try:
         while True:
             # Get current commit
-            current_commit = run_command("git rev-parse HEAD", cwd=slang_repo).strip()
+            current_commit = run_command("git rev-parse HEAD", cwd=SLANG_REPO_PATH).strip()
             
             # Evaluate current commit
             is_good, eval_results = evaluate_commit(current_commit)
@@ -231,14 +252,14 @@ def main():
             
             if is_good is None:
                 logging.warning(f"Skipping commit {current_commit} due to evaluation failure")
-                run_command("git bisect skip", cwd=slang_repo)
+                run_command("git bisect skip", cwd=SLANG_REPO_PATH)
                 continue
 
             # Run git bisect good/bad based on result
             if is_good:
-                output = run_command("git bisect good", cwd=slang_repo)
+                output = run_command("git bisect good", cwd=SLANG_REPO_PATH)
             else:
-                output = run_command("git bisect bad", cwd=slang_repo)
+                output = run_command("git bisect bad", cwd=SLANG_REPO_PATH)
 
             # Check if bisect is complete
             if "is the first bad commit" in output:
@@ -249,7 +270,7 @@ def main():
         logging.error(f"Error during bisect: {str(e)}")
     finally:
         # End bisect
-        run_command("git bisect reset", cwd=slang_repo)
+        run_command("git bisect reset", cwd=SLANG_REPO_PATH)
 
         # Write summary
         logging.info("\nBisect Summary:")
